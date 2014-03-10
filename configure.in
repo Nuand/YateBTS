@@ -134,6 +134,12 @@ AC_SUBST(THREAD_LIB)
 
 HAVE_USB=no
 
+HAVE_BLADERF=no
+AC_ARG_ENABLE(bladeRF,AC_HELP_STRING([--enable-bladeRF],[Build bladeRF transceiver if available (default: yes)]),HAVE_BLADERF=$enableval,HAVE_BLADERF=yes)
+if [[ "x$HAVE_BLADERF" != "xno" -a "x$HAVE_BLADERF" = "xno" ]]; then
+HAVE_BLADERF=check
+fi
+AC_SUBST(HAVE_BLADERF)
 
 HAVE_RAD1=no
 AC_ARG_ENABLE(rad1,AC_HELP_STRING([--enable-rad1],[Build RAD1 transceiver if available (default: yes)]),HAVE_RAD1=$enableval,HAVE_RAD1=yes)

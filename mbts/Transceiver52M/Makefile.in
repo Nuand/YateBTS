@@ -8,6 +8,10 @@ INCFILES := Complex.h convert.h convolve.h DummyLoad.h radioClock.h radioDevice.
     sigProcLib.h Transceiver.h
 LOCALLIBS = $(GSM_LIBS)
 
+ifneq (@HAVE_BLADERF@,no)
+PROGS:= $(PROGS) transceiver-bladeRF
+LOCALLIBS := $(LOCALLIBS) -lbladeRF
+endif
 ifneq (@HAVE_UHD@,no)
 PROGS:= $(PROGS) transceiver-uhd
 ifeq ($(BUILD_TESTS),yes)
@@ -32,6 +36,9 @@ OBJS := DummyLoad.o radioClock.o radioInterface.o radioInterfaceResamp.o radioVe
 EXTRACLEAN := runTransceiver.o USRPDevice.o UHDDevice.o
 
 all:
+
+transceiver-bladeRF: bladeRFDevice.cpp runTransceiver.o $(MKDEPS) $(INCFILES) $(LIBS) $(LIBDEPS)
+	$(COMPILE) -o $@ $(LOCALFLAGS) $< runTransceiver.o $(LIBS) $(LIBTHR) $(LDFLAGS) $(LOCALLIBS)
 
 transceiver-usrp1: USRPDevice.cpp USRPDevice.h runTransceiver.o $(MKDEPS) $(INCFILES) $(LIBS) $(LIBDEPS)
 	$(COMPILE) -o $@ $(LOCALFLAGS) $< runTransceiver.o $(LIBS) $(LIBTHR) $(LDFLAGS) $(LOCALLIBS)
