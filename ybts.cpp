@@ -6,7 +6,6 @@
  *
  * Yet Another Telephony Engine - Base Transceiver Station
  * Copyright (C) 2013-2014 Null Team Impex SRL
- * Copyright (C) 2014 Legba, Inc
  *
  * This software is distributed under multiple licenses;
  * see the COPYING file in the main directory for licensing
@@ -130,13 +129,17 @@ static const String s_mapOperCode = "operationCode";
 static const String s_mapUssdText = "ussd-Text";
 // Global
 static const String s_error = "error";
+static const String s_noAuth = "noauth";
 
 class YBTSConnIdHolder;                  // A connection id holder
+class YBTSConnAuth;                      // Interface for connection authenticator
+class YBTSConnAuthMt;                    // MT authenticator
 class YBTSThread;
 class YBTSThreadOwner;
 class YBTSMessage;                       // YBTS <-> BTS PDU
 class YBTSTransport;
 class YBTSGlobalThread;                  // GenObject and Thread descendent
+class YBTSConnAuthThread;                // Authenticator for MT services
 class YBTSLAI;                           // Holds local area id
 class YBTSTid;                           // Transaction identifier holder
 class YBTSConn;                          // A logical connection
@@ -155,6 +158,7 @@ class YBTSDataSource;
 class YBTSDataConsumer;
 class YBTSCallDesc;
 class YBTSChan;
+class YBTSChanThread;                    // Channel utility thread (authentication)
 class YBTSDriver;
 class YBTSMsgHandler;
 
@@ -214,6 +218,53 @@ public:
 protected:
     DebugEnabler* m_enabler;
     void* m_ptr;
+};
+
+class YBTSConnAuth
+{
+    friend class YBTSSignalling;
+public:
+    inline YBTSConnAuth(uint16_t connid, int origin)
+	: m_authSent(false), m_authOk(false), m_authNeedResync(false),
+	m_origin(origin), m_originUsed(false)
+	{ authSetConn(connid); }
+    ~YBTSConnAuth();
+    // Set connection
+    bool authSetConn(uint16_t connid);
+    // Send auth request. Wait for completion.
+    // Return true if sent (a response was receveid of request was dropped)
+    bool authSend(NamedList& params, String& reason, unsigned int* intervals = 0);
+    // End authentication
+    virtual void authEnd(bool ok, const char* error = 0, const String* rsp = 0,
+	const String* rspExt = 0);
+    void authHandleRsp(bool ok, const XmlElement& xml);
+    // Send auth reject
+    void authReject();
+    // Set auth params in list
+    void authSetParams(NamedList& list);
+    // Clear auth params in list
+    static void authClearParams(NamedList& list);
+protected:
+    RefPointer<YBTSConn> m_conn;         // The connection
+    bool m_authSent;                     // Auth sent, waiting for response
+    bool m_authOk;                       // Auth response/failure received
+    bool m_authNeedResync;               // Received auth failure with error indicating re-sync
+    String m_authRsp;                    // Received auth response
+    String m_authError;                  // Received error
+    int m_origin;                        // Auth origin
+    bool m_originUsed;                   // Origin used, auth sent at least once
+private:
+    YBTSConnAuth() {}
+};
+
+class YBTSConnAuthMt : public YBTSConnAuth
+{
+public:
+    YBTSConnAuthMt(uint16_t connid, YBTSUE* ue, int origin);
+    const char* authMt(unsigned int* intervals = 0);
+protected:
+    Message m_msg;
+    RefPointer<YBTSUE> m_ue;
 };
 
 class YBTSThread : public Thread
@@ -372,6 +423,24 @@ public:
     static Mutex s_threadsMutex;
 };
 
+class YBTSConnAuthThread : public YBTSGlobalThread, public YBTSConnAuthMt
+{
+public:
+    inline YBTSConnAuthThread(uint16_t connid, YBTSUE* ue, int origin)
+	: YBTSGlobalThread("YBTSConnAuth"), YBTSConnAuthMt(connid,ue,origin)
+	{}
+    ~YBTSConnAuthThread()
+	{ notify(true); }
+    virtual void cleanup()
+	{ notify(true); }
+protected:
+    virtual void run() {
+	    set(this,true);
+	    notify(false,authMt() == 0);
+	}
+    void notify(bool final, bool ok = false);
+};
+
 // Holds local area id
 class YBTSLAI
 {
@@ -486,11 +555,40 @@ class YBTSConn : public RefObject, public Mutex, public YBTSConnIdHolder
     friend class YBTSMM;
     friend class YBTSDriver;
 public:
+    enum Flags {
+	FNull = 0,
+	FLocUpd =   0x0001,
+	FMoCall =   0x0002,
+	FMoSms =    0x0004,
+	FMoUssd =   0x0008,
+	FCmSms =    0x0010,
+	FMtCall =   0x0200,
+	FMtSms =    0x0400,
+	FMtUssd =   0x0800,
+    };
     ~YBTSConn();
     inline YBTSUE* ue()
 	{ return m_ue; }
+    inline YBTSSignalling* owner()
+	{ return m_owner; }
+    inline bool removed() const
+	{ return m_removed; }
     inline bool waitForTraffic() const
 	{ return m_waitForTraffic != 0; }
+    inline bool authenticated() const
+	{ return m_authenticated; }
+    inline void setAuthenticated()
+	{ m_authenticated = true; }
+    inline void setAuthenticated(int flag) {
+	    if (0 != (m_authOrigin & flag))
+		m_authenticated = true;
+	}
+    inline int authSent(int flag)
+	{ return (m_authOrigin & flag); }
+    inline void setFlag(int mask)
+	{ m_flags |= mask; }
+    inline int flag(int mask) const
+	{ return (m_flags & mask); }
     // Peek at the pending XML element
     inline const XmlElement* xml() const
 	{ return m_xml; }
@@ -540,6 +638,21 @@ public:
 	{ return take ? takeSSTid(callRef,incoming) : findSSTid(callRef,incoming); }
     inline YBTSTid* getSSTid(const String& ssId, bool take)
 	{ return take ? takeSSTid(ssId) : findSSTid(ssId); }
+    // Reset auth. Notify
+    inline void authEnd(bool ok, const char* error) {
+	    if (m_auth)
+		m_auth->authEnd(ok,error);
+	    resetAuth();
+	}
+    inline void authEnd(bool ok, XmlElement& xml) {
+	    if (m_auth)
+		m_auth->authHandleRsp(ok,xml);
+	    resetAuth();
+	}
+    inline void resetAuth() {
+	    m_auth = 0;
+	    m_authTout = 0;
+	}
     // Start media traffic. Return true is already started, false if requesting
     bool startTraffic(uint8_t mode = 1);
     // Handle media traffic start response
@@ -557,6 +670,7 @@ protected:
     bool setUE(YBTSUE* ue);
 
     YBTSSignalling* m_owner;
+    bool m_removed;                      // Removed from owner
     XmlElement* m_xml;
     RefPointer<YBTSUE> m_ue;
     ObjList m_sms;                       // Pending sms
@@ -567,7 +681,13 @@ protected:
     // The following data is used by YBTSSignalling and protected by conns list mutex
     uint64_t m_timeout;                  // Connection timeout
     unsigned int m_usage;                // Usage counter
-    bool m_mtSms;                        // MT SMS was used on this connection
+    int m_extTout;                       // Use extended conn timeout
+    int m_flags;                         // Conn flags
+    // Auth
+    YBTSConnAuth* m_auth;
+    uint64_t m_authTout;
+    bool m_authenticated;                // Authenticated flag
+    int m_authOrigin;                    // Authentication sent at least once (flags)
 };
 
 class YBTSLog : public GenObject, public DebugEnabler, public Mutex,
@@ -668,6 +788,29 @@ public:
     inline bool sendSSRegister(YBTSConn* conn, const String& callRef,
 	uint8_t sapi, const char* facility)
 	{ return conn && sendSSRegister(conn->connId(),callRef,sapi,facility); }
+    // Send auth request
+    // Return negative: no connection or failure, positive: auth request pending, 0: success
+    int authStart(YBTSConn* conn, YBTSConnAuth* auth, const String& rand,
+	const String& autn, const char* keySeq);
+    inline void handleAuthRsp(bool ok, YBTSConn* conn, XmlElement& xml) {
+	    if (!conn)
+		return;
+	    Lock lck(m_connsMutex);
+	    conn->authEnd(ok,xml);
+	}
+    // Cancel connection authentication
+    inline void authCancel(YBTSConn* conn, YBTSConnAuth* auth) {
+	    if (!auth)
+		return;
+	    if (conn) {
+		Lock lck(m_connsMutex);
+		if (conn->m_auth == auth)
+		    conn->resetAuth();
+	    }
+	    auth->m_authSent = false;
+	}
+    // Send auth reject
+    void authReject(YBTSConn* conn);
     bool start();
     void stop();
     // Drop a connection
@@ -684,10 +827,18 @@ public:
     void dropAllSS(const char* reason = "net-out-of-order");
     // Increase/decrease connection usage. Update its timeout
     // Return false if connection is not found
-    inline bool setConnUsage(uint16_t connId, bool on, bool mtSms = false) {
+    inline bool setConnUsage(uint16_t connId, bool on, int flag = 0,
+	bool update = true) {
 	    Lock lck(m_connsMutex);
 	    YBTSConn* conn = findConnInternal(connId);
-	    return conn && setConnUsageInternal(*conn,on,mtSms);
+	    return conn && setConnUsageInternal(*conn,on,flag,update);
+	}
+    inline bool setConnUsage(YBTSConn* conn, bool on, int flag = 0,
+	bool update = true) {
+	    if (!conn)
+		return false;
+	    Lock lck(m_connsMutex);
+	    return setConnUsageInternal(*conn,on,flag,update);
 	}
     inline void setConnToutCheck(uint64_t tout) {
 	    if (!tout)
@@ -757,7 +908,8 @@ protected:
 	    return false;
 	}
     // Increase/decrease connection usage. Update its timeout
-    bool setConnUsageInternal(YBTSConn& conn, bool on, bool mtSms);
+    bool setConnUsageInternal(YBTSConn& conn, bool on, int flag,
+	bool update = true);
     inline void setConnToutCheckInternal(uint64_t tout) {
 	    if (tout && (!m_connsTimeout || tout < m_connsTimeout)) {
 		m_haveConnTout = true;
@@ -913,7 +1065,8 @@ protected:
     String m_paging;
 };
 
-class YBTSLocationUpd : public YBTSGlobalThread, public YBTSConnIdHolder
+class YBTSLocationUpd : public YBTSGlobalThread, public YBTSConnIdHolder,
+    public YBTSConnAuth
 {
 public:
     YBTSLocationUpd(YBTSUE& ue, uint16_t connid);
@@ -932,7 +1085,7 @@ protected:
     uint64_t m_startTime;
 };
 
-class YBTSSubmit : public YBTSGlobalThread, public YBTSConnIdHolder
+class YBTSSubmit : public YBTSGlobalThread, public YBTSConnIdHolder, public YBTSConnAuth
 {
 public:
     YBTSSubmit(YBTSTid::Type t, uint16_t connid, YBTSUE* ue, const char* callRef);
@@ -945,6 +1098,7 @@ public:
 protected:
     virtual void run();
     void notify(bool final = true);
+    bool dispatch(bool route);
 
     YBTSTid::Type m_type;
     String m_imsi;                       // UE imsi, empty if already notified termination
@@ -1015,7 +1169,8 @@ class YBTSMtSmsList : public RefObject, public Mutex
 {
 public:
     inline YBTSMtSmsList(YBTSUE* ue)
-	: Mutex(false,"YBTSMtSmsList"), m_tid(0), m_check(false), m_paging(false),
+	: Mutex(false,"YBTSMtSmsList"), m_tid(0), m_check(false),
+	m_auth(0), m_paging(false),
 	m_ue(ue)
 	{}
     inline YBTSUE* ue()
@@ -1039,6 +1194,7 @@ public:
     RefPointer<YBTSConn> m_conn;         // Used connection
     uint8_t m_tid;                       // Current TID
     bool m_check;                        // Flag used to re-check in sms wait loop
+    int m_auth;                          // Auth: 0: check, 1: authenticating, 2: checked
 
 protected:
     // Release memory. Decrease connection usage. Stop UE paging
@@ -1054,23 +1210,29 @@ class YBTSMM : public GenObject, public DebugEnabler, public Mutex
 public:
     YBTSMM(unsigned int hashLen);
     ~YBTSMM();
-    inline XmlElement* buildMM()
-	{ return new XmlElement("MM"); }
-    inline XmlElement* buildMM(XmlElement*& ch, const char* type) {
-	    XmlElement* mm = buildMM();
-	    ch = static_cast<XmlElement*>(mm->addChildSafe(new XmlElement(s_message)));
-	    ch->setAttribute(s_type,type);
-	    return mm;
-	}
     inline void saveUEs()
 	{ m_saveUEs = true; }
     void handlePDU(YBTSMessage& msg, YBTSConn* conn);
     bool handlePagingResponse(YBTSMessage& m, YBTSConn* conn, XmlElement& rsp);
+    // MT auth finished notification
+    void mtAuthTerminated(YBTSUE* ue, YBTSConn* conn, bool ok);
     void newTMSI(String& tmsi);
     void locUpdTerminated(uint64_t startTime, const String& imsi, uint16_t connId,
 	bool ok, const NamedList& params);
     void completeUe(String& buf, const String& partWord,
 	bool imsi = true, bool tmsi = false, bool imei = false);
+    static inline XmlElement* buildMM()
+	{ return new XmlElement("MM"); }
+    static inline XmlElement* buildMM(XmlElement*& ch, const char* type) {
+	    XmlElement* mm = buildMM();
+	    ch = static_cast<XmlElement*>(mm->addChildSafe(new XmlElement(s_message)));
+	    ch->setAttribute(s_type,type);
+	    return mm;
+	}
+    static inline XmlElement* buildMM(const char* type) {
+	    XmlElement* ch = 0;
+	    return buildMM(ch,type);
+	}
 protected:
     void handleIdentityResponse(YBTSMessage& m, const XmlElement& xml, YBTSConn* conn);
     void handleLocationUpdate(YBTSMessage& msg, const XmlElement& xml, YBTSConn* conn);
@@ -1204,6 +1366,8 @@ public:
 
 class YBTSChan : public Channel, public YBTSConnIdHolder
 {
+    friend class YBTSChanThread;
+    friend class YBTSDriver;
 public:
     // Incoming
     YBTSChan(YBTSConn* conn);
@@ -1225,6 +1389,8 @@ public:
     void connReleased();
     // Check if MT call can be accepted
     bool canAcceptMT();
+    // Init MT call if possible
+    bool initMT();
     // Start a MT call after UE connected
     void startMT(YBTSConn* conn = 0, bool pagingRsp = false);
     // BTS stopping notification
@@ -1254,10 +1420,13 @@ protected:
 	}
     void allocTraffic();
     void stopPaging();
-    inline Message* takeRoute() {
+    inline Message* takeRoute(bool* initial = 0) {
 	    Lock lck(driver());
+	    if (initial)
+		*initial = m_routeInitial;
 	    Message* m = m_route;
 	    m_route = 0;
+	    m_routeInitial = false;
 	    return m;
 	}
     inline bool route() {
@@ -1267,9 +1436,21 @@ protected:
 	    m->userData(0);
 	    return startRouter(m);
 	}
+    inline void progressedIn() {
+	    if (!isIncoming())
+		return;
+	    releaseRoute();
+	    if (m_conn)
+		m_conn->setAuthenticated(YBTSConn::FMoCall);
+	}
     // Release route message.
     // Deref if we have a pending message and not final and not connected
     bool releaseRoute(bool final = false);
+    // Auth thread
+    bool startAuthThread();
+    void cancelAuthThread();
+    // Set connection if not already set
+    YBTSConn* setConn(YBTSConn* conn);
     virtual void disconnected(bool final, const char *reason);
     virtual bool callRouted(Message& msg);
     virtual void callAccept(Message& msg);
@@ -1301,6 +1482,24 @@ protected:
     uint64_t m_tout;
     YBTSCallDesc* m_activeCall;
     ObjList* m_pending;
+    Message* m_route;
+    bool m_routeInitial;                 // m_route is the initial route message
+    YBTSChanThread* m_authThread;        // Auth thread
+    unsigned int m_authIndex;            // Number of auth requests sent
+};
+
+class YBTSChanThread : public Thread, public YBTSConnAuthMt
+{
+public:
+    YBTSChanThread(YBTSChan& chan, Message* msg);
+    ~YBTSChanThread()
+	{ notify(); }
+    virtual void cleanup()
+	{ notify(); }
+protected:
+    virtual void run();
+    void notify(const char* error = "failure");
+    RefPointer<YBTSChan> m_chan;
     Message* m_route;
 };
 
@@ -1372,7 +1571,10 @@ public:
     // Handle SS PDUs
     void handleSSPDU(YBTSMessage& m, YBTSConn* conn);
     // Check if a MT service is pending for new connection and start it
-    void checkMtService(YBTSUE* ue, YBTSConn* conn, bool pagingRsp = false);
+    void checkMtService(YBTSUE* ue, YBTSConn* conn, bool pagingRsp = false,
+	bool sapiEstablish = false);
+    // Check if there is any paging MT service for a given UE
+    int havePagingMtService(YBTSUE* ue, bool call, bool sms, bool ussd);
     // Handle media start/alloc response
     void handleMediaStartRsp(YBTSConn* conn, bool ok);
     // Add a pending (wait termination) call
@@ -1384,7 +1586,7 @@ public:
     // Handshake done notification. Return false if state is invalid
     bool handshakeDone();
     // Conn release notification
-    void connReleased(uint16_t connId);
+    void connReleased(uint16_t connId, YBTSConn* conn = 0);
     // Handle USSD update/finalize messages
     bool handleUssd(Message& msg, bool update);
     // Handle USSD execute messages
@@ -1397,6 +1599,10 @@ public:
     bool radioReady();
     void restart(unsigned int restartMs = 1, unsigned int stopIntervalMs = 0);
     void stopNoRestart();
+    inline bool haveChan(const String& chanId) {
+	    Lock lck(this);
+	    return 0 != find(chanId);
+	}
     inline bool findChan(uint16_t connId, RefPointer<YBTSChan>& chan) {
 	    Lock lck(this);
 	    chan = findChanConnId(connId);
@@ -1406,7 +1612,7 @@ public:
 	    Lock lck(this);
 	    chan = findChanUE(ue);
 	    return chan != 0;
-    }
+	}
     // Safely check pending MT SMS
     inline void checkMtSms(YBTSUE* ue) {
 	    RefPointer<YBTSMtSmsList> list;
@@ -1453,7 +1659,7 @@ protected:
     void handleSmsCPRsp(YBTSMessage& m, YBTSConn* conn,
 	const String& callRef, bool tiFlag, const XmlElement& rsp, bool ok);
     // Check for MT SMS in list. Return false if the list is empty
-    bool checkMtSms(YBTSMtSmsList& list);
+    bool checkMtSms(YBTSMtSmsList& list, unsigned int* toutAuth = 0);
     // Handle pending MP SMS final response
     // Return false if not found
     bool handleMtSmsRsp(YBTSUE* ue, bool ok, const String& callRef,
@@ -1484,6 +1690,7 @@ protected:
     bool submitUssd(YBTSConn* conn, const String& callRef, const String& ssId,
 	XmlElement*& facilityXml, XmlElement* comp);
     void checkMtSsTout(const Time& time = Time());
+    const char* authConnMt(YBTSConn* conn, bool sms, unsigned int& toutMs);
     void start();
     inline void startIdle() {
 	    Lock lck(m_stateMutex);
@@ -1612,9 +1819,15 @@ static unsigned int s_t305 = 30000;      // DISC sent, no inband tone available
 static unsigned int s_t308 = 5000;       // REL sent (operator specific, no default in spec)
                                          // First expire: re-send REL, second expire: release call
 static unsigned int s_t313 = 5000;       // Send Connect, expect Connect Ack, clear call on expire
+// Authentication timers
+// ETSI TS 124.008 Section 11.2
+static unsigned int s_t3260 = 720000;    // Sent AUTHENTICATION REQUEST, wait for response
 
 static uint32_t s_tmsiExpire = 864000;   // TMSI expiration, default 10 days
 static bool s_tmsiSave = false;          // Save TMSIs to file
+static bool s_authMtCall = false;        // Authenticate MT call
+static bool s_authMtSms = false;         // Authenticate MT SMS
+static bool s_authMtUssd = false;        // Authenticate MT USSD
 
 static const String s_statusCmd = "status";
 static const String s_startCmd = "start";
@@ -1627,7 +1840,7 @@ static const String s_statusUeImei = "imei";
 static const String s_statusUeMsisdn = "msisdn";
 
 ObjList YBTSGlobalThread::s_threads;
-Mutex YBTSGlobalThread::s_threadsMutex(false,"YBTSGlobalThread");
+Mutex YBTSGlobalThread::s_threadsMutex(false,"YBTSGlobal");
 
 #define YBTS_MAKENAME(x) {#x, x}
 #define YBTS_XML_GETCHILD_PTR_CONTINUE(x,tag,ptr) \
@@ -2014,12 +2227,35 @@ static inline unsigned int getMaxPddPaging(const NamedList& list, unsigned int m
     return list.getIntValue(YSTRING("maxpdd"),defVal,minVal,maxVal);
 }
 
+static inline bool threadExiting(String& reason)
+{
+    if (!(Thread::check(false) || Engine::exiting()))
+	return false;
+    reason << (Engine::exiting() ? "exiting" : "cancelled");
+    return true;
+}
+
 static void moveList(ObjList& dest, ObjList& src)
 {
     ObjList* a = &dest;
     for (ObjList* o = src.skipNull(); o; o = o->skipNull())
 	a = a->append(o->remove(false));
     src.clear();
+}
+
+static void clearListParams(NamedList& list, const String& p1,
+    const String& p2 = String::empty(),
+    const String& p3 = String::empty())
+{
+    for (ObjList* o = list.paramList()->skipNull(); o;) {
+	NamedString* ns = static_cast<NamedString*>(o->get());
+	if (ns->name() == p1 || ns->name() == p2 || ns->name() == p3) {
+	    o->remove();
+	    o = o->skipNull();
+	}
+	else
+	    o = o->skipNext();
+    }
 }
 
 // Append an xml element from list parameter
@@ -2045,6 +2281,14 @@ static inline void getGlobalUInt64(uint64_t& buf, const uint64_t& value)
 {
     Lock lck(s_globalMutex);
     buf = value;
+}
+
+inline void setIntMask(int& flags, int mask, bool on = true)
+{
+    if (on)
+	flags |= mask;
+    else
+	flags &= ~mask;
 }
 
 static inline bool isValidStartTime(uint64_t val)
@@ -2224,6 +2468,264 @@ static inline XmlElement* buildTID(const char* callRef, bool tiFlag)
     XmlElement* tid = new XmlElement(s_ccCallRef,callRef);
     tid->setAttribute(s_ccTIFlag,String::boolText(tiFlag));
     return tid;
+}
+
+
+//
+// YBTSConnAuth
+//
+YBTSConnAuth::~YBTSConnAuth()
+{
+    if (m_authSent && m_conn)
+	m_conn->owner()->authCancel(m_conn,this);
+}
+
+// Set connection
+bool YBTSConnAuth::authSetConn(uint16_t connid)
+{
+    if (m_conn)
+	return (m_conn->connId() == connid);
+    return __plugin.signalling() && __plugin.signalling()->findConn(m_conn,connid,false);
+}
+
+static inline bool decIntervals(unsigned int* intervals, String& reason)
+{
+    if (!intervals)
+	return true;
+    if (*intervals)
+	(*intervals)--;
+    if (*intervals)
+	return true;
+    reason << "timeout";
+    return false;
+}
+
+// Send auth request. Wait for completion
+bool YBTSConnAuth::authSend(NamedList& params, String& reason, unsigned int* intervals)
+{
+    const String& rand = params[YSTRING("auth.rand")];
+    if (!rand) {
+	reason = "missing rand parameter";
+	return false;
+    }
+    const String& autn = params[YSTRING("auth.autn")];
+    const char* keySeq = params.getValue(YSTRING("auth.keysequence"),"0");
+    if (m_authSent || !m_conn) {
+	reason << "invalid state";
+	return false;
+    }
+    while (true) {
+	int res = -1;
+	if (__plugin.signalling())
+	    res = m_conn->owner()->authStart(m_conn,this,rand,autn,keySeq);
+	if (threadExiting(reason)) {
+	    if (!res)
+		m_conn->owner()->authCancel(m_conn,this);
+	    return false;
+	}
+	if (!res)
+	    break;
+	if (res < 0) {
+	    reason << "net-out-of-order";
+	    return false;
+	}
+	Thread::idle();
+	if (threadExiting(reason) || !decIntervals(intervals,reason)) {
+	    m_conn->owner()->authCancel(m_conn,this);
+	    return false;
+	}
+    }
+    // Wait for completion
+    while (m_authSent) {
+	Thread::idle();
+	if (threadExiting(reason) || !decIntervals(intervals,reason)) {
+	    m_conn->owner()->authCancel(m_conn,this);
+	    return true;
+	}
+    }
+    return true;
+}
+
+// End authentication
+void YBTSConnAuth::authEnd(bool ok, const char* error, const String* rsp,
+    const String* rspExt)
+{
+    if (!m_authSent)
+	return;
+    Debug(&__plugin,DebugAll,"Auth ended conn=%u ok=%u error=%s rsp=%s ext=%s",
+	(m_conn ? m_conn->connId() : 0),ok,error,
+	TelEngine::c_str(rsp),TelEngine::c_str(rspExt));
+    m_authOk = ok;
+    m_authNeedResync = false;
+    m_authError.clear();
+    m_authRsp.clear();
+    if (ok) {
+	if (!TelEngine::null(rsp))
+	    m_authRsp << *rsp << TelEngine::c_str(rspExt);
+	else {
+	    Debug(&__plugin,DebugNote,"Missing RES in auth response on conn %u",
+		m_conn ? m_conn->connId() : 0);
+	    m_authOk = false;
+	}
+    }
+    else {
+	m_authError = error;
+	m_authNeedResync = (m_authError == YSTRING("synch-failure"));
+	if (m_authNeedResync) {
+	    if (!TelEngine::null(rsp))
+		m_authRsp = *rsp;
+	    else {
+		m_authNeedResync = false;
+		Debug(&__plugin,DebugNote,"Missing AUTS in auth response on conn %u",
+		    m_conn ? m_conn->connId() : 0);
+	    }
+	}
+    }
+    m_authSent = false;
+}
+
+void YBTSConnAuth::authHandleRsp(bool ok, const XmlElement& xml)
+{
+    if (ok)
+	authEnd(true,0,xml.childText(YSTRING("res")),xml.childText(YSTRING("xres2")));
+    else
+	authEnd(false,TelEngine::c_str(xml.childText(YSTRING("RejectCause"))),
+	    xml.childText(YSTRING("auts")));
+}
+
+// Send auth reject
+void YBTSConnAuth::authReject()
+{
+    if (m_conn)
+	m_conn->owner()->authReject(m_conn);
+}
+
+void YBTSConnAuth::authSetParams(NamedList& list)
+{
+    authClearParams(list);
+    if (m_authOk)
+	list.addParam("auth.response",m_authRsp);
+    else {
+	list.addParam(s_error,m_authError.safe("failure"));
+	list.addParam(YSTRING("auth.auts"),m_authRsp,false);
+    }
+}
+
+void YBTSConnAuth::authClearParams(NamedList& list)
+{
+    clearListParams(list,s_error,YSTRING("auth.response"),YSTRING("auth.auts"));
+}
+
+
+//
+// YBTSConnAuthMt
+//
+YBTSConnAuthMt::YBTSConnAuthMt(uint16_t connid, YBTSUE* ue, int origin)
+    : YBTSConnAuth(connid,origin),
+    m_msg("auth")
+{
+    if (m_conn)
+	m_ue = m_conn->ue();
+    if (!m_ue)
+	m_ue = ue;
+    if (!(m_conn && m_ue))
+	return;
+    m_msg.addParam("module",__plugin.name());
+    Lock lck(m_ue);
+    m_msg.addParam("imsi",m_ue->imsi());
+    m_msg.addParam("msisdn",m_ue->msisdn(),false);
+    m_msg.addParam("imei",m_ue->imei(),false);
+    m_msg.addParam("tmsi",m_ue->tmsi(),false);
+    switch (origin) {
+	case YBTSConn::FMtCall:
+	    m_msg.addParam("type","call");
+	    break;
+	case YBTSConn::FMtSms:
+	    m_msg.addParam("type","msg");
+	    break;
+	case YBTSConn::FMtUssd:
+	    m_msg.addParam("type","ussd");
+	    break;
+    }
+}
+
+// Flow:
+// 1: Dispatch 'auth'.
+//    Check error. 'noauth': send AUTH REQ
+// 2: Dispatch 'auth' with credentials (might signal re-sync)
+//    Check error. 'noauth': send AUTH REQ
+//    Don't accept re-sync
+// 3. Dispatch 'auth' with credentials
+//    Check error. Accept or not the connection
+const char* YBTSConnAuthMt::authMt(unsigned int* intervals)
+{
+    if (!m_conn)
+	return "net-out-of-order";
+    uint64_t time = 0;
+    String reason;
+    for (int index = 1; true; index++) {
+	if (intervals)
+	    time = Time::msecNow();
+	bool ok = Engine::dispatch(m_msg);
+	if (threadExiting(reason))
+	    break;
+	if (m_conn->removed()) {
+	    reason = "net-out-of-order";
+	    break;
+	}
+	if (intervals) {
+	    unsigned int n = threadIdleIntervals(Time::msecNow() - time);
+	    if (n >= *intervals)
+		*intervals = 0;
+	    else
+		*intervals -= n;
+	    if (!*intervals) {
+		reason = "timeout";
+		break;
+	    }
+	}
+	if (!ok) {
+	    reason = "auth message not handled";
+	    break;
+	}
+	const String& err = m_msg[s_error];
+	if (!err) {
+	    m_conn->setAuthenticated();
+	    return 0;
+	}
+	// We have an error
+	// Last cycle or error is not noauth: stop here
+	if (index > 2 || err != s_noAuth)
+	    break;
+	ok = authSend(m_msg,reason,intervals);
+	if (!ok || reason || threadExiting(reason))
+	    break;
+	// Last cycle: ignore resync error
+	if (index == 2)
+	    m_authNeedResync = false;
+	if (!(m_authOk || m_authNeedResync))
+	    break;
+	authSetParams(m_msg);
+    }
+    if (reason)
+	Debug(&__plugin,DebugNote,"Failed to complete MT authentication on conn %u: %s",
+	    m_conn->connId(),reason.c_str());
+    if (m_conn && !(m_origin || m_conn->authSent(m_origin)) &&
+	isValidStartTime(m_msg.msgTime())) {
+	Debug(&__plugin,DebugNote,"Rejecting MT authentication on conn %u",
+	    m_conn->connId());
+	authReject();
+    }
+    const char* retVal = "failure";
+    if (reason == YSTRING("timeout"))
+	retVal = "timeout";
+    else if (reason == YSTRING("net-out-of-order"))
+	retVal = "cancelled";
+    else if (reason == YSTRING("cancelled"))
+	retVal = "cancelled";
+    else if (reason == YSTRING("exiting"))
+	retVal = "exiting";
+    return retVal;
 }
 
 
@@ -2591,6 +3093,23 @@ bool YBTSGlobalThread::cancelAll(bool hard, unsigned int waitMs)
 
 
 //
+// YBTSConnAuthThread
+//
+void YBTSConnAuthThread::notify(bool final, bool ok)
+{
+    if (!m_ue)
+	return;
+    if (final && !Engine::exiting())
+	Alarm(&__plugin,"system",DebugWarn,
+	    "MT auth thread conn=%u abnormally terminated [%p]",
+	    (m_conn ? m_conn->connId() : 0),this);
+    if (__plugin.mm() && isValidStartTime(m_msg.msgTime()))
+	__plugin.mm()->mtAuthTerminated(m_ue,m_conn,ok);
+    m_ue = 0;
+}
+
+
+//
 // YBTSLAI
 //
 YBTSLAI::YBTSLAI(const XmlElement& xml)
@@ -2620,14 +3139,21 @@ XmlElement* YBTSLAI::build() const
 YBTSConn::YBTSConn(YBTSSignalling* owner, uint16_t connId)
     : Mutex(false,"YBTSConn"),
     YBTSConnIdHolder(connId),
-    m_owner(owner), m_xml(0),
+    m_owner(owner),
+    m_removed(false),
+    m_xml(0),
     m_ss(0),
     m_traffic(0),
     m_waitForTraffic(0),
     m_sapiUp(1),
     m_timeout(0),
     m_usage(0),
-    m_mtSms(false)
+    m_extTout(0),
+    m_flags(0),
+    m_auth(0),
+    m_authTout(0),
+    m_authenticated(false),
+    m_authOrigin(0)
 {
 }
 
@@ -2666,7 +3192,7 @@ void YBTSConn::startTrafficRsp(bool ok)
 	return;
     Debug(__plugin.signalling(),ok ? DebugAll : DebugNote,
 	"Connection %u traffic channel set %s mode=%u [%p]",
-	connId(),(ok ? "succeded" : "failed"),m_waitForTraffic,__plugin.signalling());
+	connId(),(ok ? "succeeded" : "failed"),m_waitForTraffic,__plugin.signalling());
     if (ok)
 	m_traffic = m_waitForTraffic;
     m_waitForTraffic = 0;
@@ -2993,6 +3519,12 @@ int YBTSSignalling::checkTimers(const Time& time)
 		    else
 			setConnToutCheckInternal(c->m_ss->m_timeout);
 		}
+		if (c->m_authTout) {
+		    if (c->m_authTout <= time)
+			c->authEnd(false,"timeout");
+		    else
+			setConnToutCheckInternal(c->m_authTout);
+		}
 		if (!c->m_timeout)
 		    continue;
 		if (Engine::exiting() || c->m_timeout <= time)
@@ -3081,6 +3613,47 @@ bool YBTSSignalling::sendSmsRPRsp(YBTSConn* conn, const String& callRef, bool ti
     return sendSmsCPData(conn,callRef,tiFlag,sapi,rpdu);
 }
 
+// Send auth request.
+// Return 0: success, negative: no connection or failure, positive: auth request pending
+int YBTSSignalling::authStart(YBTSConn* conn, YBTSConnAuth* auth, const String& rand,
+    const String& autn, const char* keySeq)
+{
+    if (!auth)
+	return -1;
+    Lock lck(m_connsMutex);
+    if (!conn || conn->removed())
+	return -2;
+    if (conn->m_auth)
+	return 1;
+    if (conn->waitForTraffic())
+	return 2;
+    XmlElement* ch = 0;
+    XmlElement* xml = YBTSMM::buildMM(ch,"AuthenticationRequest");
+    ch->addChildSafe(new XmlElement("CipheringKeySequenceNumber",keySeq));
+    ch->addChildSafe(new XmlElement("rand",rand));
+    if (autn)
+	ch->addChildSafe(new XmlElement("autn",autn));
+    auth->m_authSent = conn->sendL3(xml);
+    if (!auth->m_authSent)
+	return -3;
+    auth->m_originUsed = true;
+    conn->m_authOrigin |= auth->m_origin;
+    conn->m_auth = auth;
+    conn->m_authTout = Time::now() + s_t3260 * 1000;
+    setConnToutCheckInternal(conn->m_authTout);
+    return 0;
+}
+
+// Send auth reject
+void YBTSSignalling::authReject(YBTSConn* conn)
+{
+    if (!conn)
+	return;
+    if (!conn->removed())
+	conn->sendL3(YBTSMM::buildMM("AuthenticationReject"));
+    dropConn(conn->connId(),true);
+}
+
 bool YBTSSignalling::start()
 {
     stop();
@@ -3132,6 +3705,8 @@ void YBTSSignalling::dropConn(uint16_t connId, bool notifyPeer)
 	if (c->connId() != connId)
 	    continue;
 	conn = c;
+	c->authEnd(false,"net-out-of-order");
+	c->m_removed = true;
 	Debug(this,DebugAll,"Removing connection (%p,%u) [%p]",c,connId,this);
 	o->remove();
 	break;
@@ -3149,9 +3724,9 @@ void YBTSSignalling::dropConn(uint16_t connId, bool notifyPeer)
 	    YBTSMessage m(SigConnRelease,0,connId);
 	    send(m);
 	}
-	conn = 0;
     }
-    __plugin.connReleased(connId);
+    __plugin.connReleased(connId,conn);
+    conn = 0;
 }
 
 // Drop SS session
@@ -3189,7 +3764,7 @@ bool YBTSSignalling::addMOSms(YBTSConn* conn, const String& callRef, uint8_t sap
     XDebug(this,DebugAll,"Added MO SMS (%p) tid=%s to conn %u [%p]",
 	i,i->m_callRef.c_str(),conn->connId(),this);
     lck.drop();
-    setConnUsage(conn->connId(),true);
+    setConnUsage(conn->connId(),true,YBTSConn::FMoSms);
     return true;
 }
 
@@ -3208,7 +3783,7 @@ YBTSSmsInfo* YBTSSignalling::removeSms(YBTSConn* conn, const String& callRef,
     XDebug(this,DebugAll,"Removed %s SMS (%p) tid=%s from conn %u [%p]",
 	(incoming ? "MO" : "MT"),i,i->m_callRef.c_str(),conn->connId(),this);
     lck.drop();
-    setConnUsage(conn->connId(),false);
+    setConnUsage(conn,false,incoming ? YBTSConn::FMoSms : 0);
     return i;
 }
 
@@ -3342,18 +3917,31 @@ bool YBTSSignalling::findConnSSTid(RefPointer<YBTSConn>& conn, const String& ssI
 }
 
 // Increase/decrease connection usage. Update its timeout
-bool YBTSSignalling::setConnUsageInternal(YBTSConn& conn, bool on, bool mtSms)
+bool YBTSSignalling::setConnUsageInternal(YBTSConn& conn, bool on, int flag, bool update)
 {
+    switch (flag) {
+	case YBTSConn::FMoSms:
+	    if (on)
+		setIntMask(conn.m_extTout,YBTSConn::FCmSms,false);
+	    break;
+	case YBTSConn::FMtSms:
+	    if (on)
+		setIntMask(conn.m_extTout,YBTSConn::FMtSms);
+	    break;
+	case YBTSConn::FCmSms:
+	    setIntMask(conn.m_extTout,flag,on);
+	    break;
+    }
+    if (!update)
+	return true;
     if (on)
 	conn.m_usage++;
     else if (conn.m_usage)
 	conn.m_usage--;
-    if (mtSms && on)
-	conn.m_mtSms = true;
     if (conn.m_usage)
 	conn.m_timeout = 0;
     else if (!conn.m_timeout) {
-	if (!conn.m_mtSms)
+	if (!conn.m_extTout)
 	    conn.m_timeout = Time::now() + (uint64_t)m_connIdleIntervalMs * 1000;
 	else
 	    conn.m_timeout = Time::now() + (uint64_t)m_connIdleMtSmsIntervalMs * 1000;
@@ -3538,7 +4126,7 @@ int YBTSSignalling::handlePDU(YBTSMessage& msg)
 		findConn(conn,msg.connId(),false);
 		if (conn) {
 		    conn->sapiEstablish(msg.info());
-		    __plugin.checkMtService(conn->ue(),conn);
+		    __plugin.checkMtService(conn->ue(),conn,false,true);
 		}
 	    }
 	    return Ok;
@@ -3875,6 +4463,7 @@ void YBTSUE::stopPagingNow()
 YBTSLocationUpd::YBTSLocationUpd(YBTSUE& ue, uint16_t connid)
     : YBTSGlobalThread("YBTSLocUpd"),
     YBTSConnIdHolder(connid),
+    YBTSConnAuth(connid,YBTSConn::FLocUpd),
     m_msg("user.register"),
     m_startTime(Time::now())
 {
@@ -3886,6 +4475,18 @@ YBTSLocationUpd::YBTSLocationUpd(YBTSUE& ue, uint16_t connid)
     m_msg.addParam("tmsi",ue.tmsi(),false);
 }
 
+#define YBTS_LOCUPD_CHECK_STOP { \
+    bool valid = isValidStartTime(m_startTime); \
+    if (!valid || Thread::check(false) || Engine::exiting()) { \
+	if (!valid) \
+	    m_imsi.clear(); \
+	if (rej) \
+	    authReject(); \
+	notify(false,false); \
+	return; \
+    } \
+}
+
 void YBTSLocationUpd::run()
 {
     set(this,true);
@@ -3894,8 +4495,46 @@ void YBTSLocationUpd::run()
     Debug(&__plugin,DebugAll,"Started location updating thread for IMSI=%s [%p]",
 	m_imsi.c_str(),this);
     bool ok = Engine::dispatch(m_msg);
-    if (Thread::check(false) || Engine::exiting())
-	m_imsi.clear();
+    bool rej = !ok && (m_msg[s_error] == s_noAuth);
+    YBTS_LOCUPD_CHECK_STOP;
+    if (ok || !rej) {
+	notify(false,ok);
+	return;
+    }
+    String reason;
+    ok = authSend(m_msg,reason);
+    YBTS_LOCUPD_CHECK_STOP;
+    while (ok && (m_authOk || m_authNeedResync)) {
+	authSetParams(m_msg);
+	ok = Engine::dispatch(m_msg);
+	rej = !ok && (m_msg[s_error] == s_noAuth);
+	YBTS_LOCUPD_CHECK_STOP;
+	if (ok || !rej)
+	    break;
+	ok = authSend(m_msg,reason);
+	YBTS_LOCUPD_CHECK_STOP;
+	if (!ok)
+	    break;
+	if (!m_authOk) {
+	    ok = false;
+	    break;
+	}
+	authSetParams(m_msg);
+	ok = Engine::dispatch(m_msg);
+	rej = !ok && (m_msg[s_error] == s_noAuth);
+	YBTS_LOCUPD_CHECK_STOP;
+	break;
+    }
+    if (reason)
+	Debug(&__plugin,DebugNote,
+	    "Failed to complete location updating authentication IMSI=%s: %s [%p]",
+	    m_imsi.c_str(),reason.c_str(),this);
+    if (rej) {
+	Debug(&__plugin,DebugNote,
+	    "Location updating IMSI=%s: rejecting authentication [%p]",
+	    m_imsi.c_str(),this);
+	authReject();
+    }
     notify(false,ok);
 }
 
@@ -3928,6 +4567,7 @@ YBTSSubmit::YBTSSubmit(YBTSTid::Type t, uint16_t connid, YBTSUE* ue,
     const char* callRef)
     : YBTSGlobalThread("YBTSSubmit"),
     YBTSConnIdHolder(connid),
+    YBTSConnAuth(connid,0),
     m_type(t),
     m_callRef(callRef),
     m_msg("call.route"),
@@ -3938,9 +4578,11 @@ YBTSSubmit::YBTSSubmit(YBTSTid::Type t, uint16_t connid, YBTSUE* ue,
     switch (t) {
 	case YBTSTid::Sms:
 	    m_msg.addParam("route_type","msg");
+	    m_origin = YBTSConn::FMoSms;
 	    break;
 	case YBTSTid::Ussd:
 	    m_msg.addParam("route_type","ussd");
+	    m_origin = YBTSConn::FMoUssd;
 	    break;
 	default:
 	    m_imsi.clear();
@@ -3950,6 +4592,7 @@ YBTSSubmit::YBTSSubmit(YBTSTid::Type t, uint16_t connid, YBTSUE* ue,
 	m_imsi = ue->imsi();
 	ue->addCaller(m_msg);
     }
+    m_msg.addParam("username",m_imsi,false);
 }
 
 void YBTSSubmit::run()
@@ -3959,12 +4602,7 @@ void YBTSSubmit::run()
 	"Started MO submit thread type=%s IMSI=%s callRef=%s [%p]",
 	YBTSTid::typeName(m_type),m_imsi.c_str(),m_callRef.c_str(),this);
     while (m_imsi) {
-	if (!Engine::dispatch(m_msg))
-	    break;
-	if (Thread::check(false) || Engine::exiting())
-	    break;
-	if (!m_msg.retValue() || m_msg.retValue() == YSTRING("-") ||
-	    m_msg.retValue() == s_error)
+	if (!dispatch(true))
 	    break;
 	switch (m_type) {
 	    case YBTSTid::Sms:
@@ -3979,13 +4617,19 @@ void YBTSSubmit::run()
 	if (!m_msg)
 	    break;
 	m_msg.setParam("callto",m_msg.retValue());
-	m_msg.clearParam(s_error);
-	m_msg.clearParam(YSTRING("reason"));
+	clearListParams(m_msg,s_error,YSTRING("reason"));
 	m_msg.retValue().clear();
-	m_ok = Engine::dispatch(m_msg);
+	authClearParams(m_msg);
+	m_ok = dispatch(false);
 	if (m_ok)
 	    m_cause = 0;
 	break;
+    }
+    if (m_ok && m_originUsed && isValidStartTime(m_msg.msgTime()) &&
+	__plugin.signalling()) {
+	RefPointer<YBTSConn> conn;
+	if (__plugin.signalling()->findConn(conn,connId(),false))
+	    conn->setAuthenticated(m_origin);
     }
     if (Thread::check(false) || Engine::exiting()) {
 	m_imsi.clear();
@@ -4034,6 +4678,69 @@ void YBTSSubmit::notify(bool final)
 	    break;
 	default: ;
     }
+}
+
+static inline bool routeOk(Message& msg)
+{
+    if (!msg.retValue() || msg.retValue() == YSTRING("-") || msg.retValue() == s_error)
+	return false;
+    return true;
+}
+
+bool YBTSSubmit::dispatch(bool route)
+{
+    bool ok = Engine::dispatch(m_msg);
+    if (Thread::check(false) || Engine::exiting())
+	return false;
+    if (!ok && route)
+	return false;
+    if (route) {
+	if (routeOk(m_msg))
+	    return true;
+	if (m_msg[s_error] != s_noAuth)
+	    return false;
+    }
+    else if (ok || m_msg[s_error] != s_noAuth)
+	return ok;
+    String reason;
+    ok = authSend(m_msg,reason);
+    bool rej = true;
+    while (ok && !reason && (m_authOk || m_authNeedResync)) {
+	if (threadExiting(reason))
+	    break;
+	authSetParams(m_msg);
+	ok = Engine::dispatch(m_msg);
+	if (route)
+	    ok = ok && routeOk(m_msg);
+	rej = !ok && (m_msg[s_error] == s_noAuth);
+	if (threadExiting(reason))
+	    break;
+	if (ok || !rej)
+	    break;
+	ok = authSend(m_msg,reason);
+	if (!ok || reason || threadExiting(reason) || !m_authOk)
+	    break;
+	authSetParams(m_msg);
+	ok = Engine::dispatch(m_msg);
+	if (route)
+	    ok = ok && routeOk(m_msg);
+	rej = !ok && (m_msg[s_error] == s_noAuth);
+	threadExiting(reason);
+	break;
+    }
+    if (!(reason || rej))
+	return ok;
+    if (reason)
+	Debug(&__plugin,DebugNote,
+	    "Failed to complete authentication for MO submit type=%s IMSI=%s callRef=%s: %s [%p]",
+	    YBTSTid::typeName(m_type),m_imsi.c_str(),m_callRef.c_str(),reason.c_str(),this);
+    if (rej) {
+	Debug(&__plugin,DebugNote,
+	    "Rejecting authentication for MO submit type=%s IMSI=%s callRef=%s [%p]",
+	    YBTSTid::typeName(m_type),m_imsi.c_str(),m_callRef.c_str(),this);
+	authReject();
+    }
+    return false;
 }
 
 
@@ -4085,7 +4792,7 @@ void YBTSMtSmsList::destroyed()
 {
     stopPaging();
     if (m_conn && __plugin.signalling())
-	__plugin.signalling()->setConnUsage(m_conn->connId(),false,true);
+	__plugin.signalling()->setConnUsage(m_conn,false,YBTSConn::FMtSms);
 }
 
 
@@ -4114,6 +4821,20 @@ YBTSMM::~YBTSMM()
     delete[] m_ueTMSI;
 }
 
+// MT auth finished notification
+void YBTSMM::mtAuthTerminated(YBTSUE* ue, YBTSConn* conn, bool ok)
+{
+    Debug(this,DebugAll,"MT auth terminated ok=%u ue=%p conn=%p [%p]",
+	ok,ue,conn,this);
+    if (ue)
+	ue->stopPagingNow();
+    if (ok && ue && conn && !conn->setUE(ue))
+	conn = 0;
+    // Always notify paging response even if something went wrong with the connection
+    // This will allow entities waiting for paging response to stop waiting
+    __plugin.checkMtService(ue,conn,true);
+}
+
 void YBTSMM::newTMSI(String& tmsi)
 {
     do {
@@ -4138,6 +4859,12 @@ void YBTSMM::newTMSI(String& tmsi)
 void YBTSMM::locUpdTerminated(uint64_t startTime, const String& imsi, uint16_t connId,
     bool ok, const NamedList& params)
 {
+    bool valid = isValidStartTime(startTime);
+    RefPointer<YBTSConn> conn;
+    if (valid && __plugin.signalling())
+        __plugin.signalling()->findConn(conn,connId,false);
+    if (conn && ok)
+	conn->setAuthenticated(YBTSConn::FLocUpd);
     if (!imsi)
 	return;
     RefPointer<YBTSUE> ue;
@@ -4147,7 +4874,6 @@ void YBTSMM::locUpdTerminated(uint64_t startTime, const String& imsi, uint16_t c
 	    Engine::enqueue(buildUnregister(imsi));
 	return;
     }
-    bool valid = isValidStartTime(startTime);
     Lock lckUE(ue);
     // IMSI already detached: revert succesful registration
     if (ue->imsiDetached()) {
@@ -4182,9 +4908,6 @@ void YBTSMM::locUpdTerminated(uint64_t startTime, const String& imsi, uint16_t c
     lckUE.drop();
     updateExpire(ue);
     saveUEs();
-    RefPointer<YBTSConn> conn;
-    if (valid && __plugin.signalling())
-        __plugin.signalling()->findConn(conn,connId,false);
     if (conn) {
 	conn->sendL3(mm);
 	if (!ok)
@@ -4364,6 +5087,10 @@ void YBTSMM::handlePDU(YBTSMessage& m, YBTSConn* conn)
 	__plugin.signalling()->dropConn(m.connId(),true);
     else if (*t == YSTRING("IdentityResponse"))
 	handleIdentityResponse(m,*ch,conn);
+    else if (*t == "AuthenticationResponse")
+	__plugin.signalling()->handleAuthRsp(true,conn,*ch);
+    else if (*t == "AuthenticationFailure")
+	__plugin.signalling()->handleAuthRsp(false,conn,*ch);
     else {
 	if (*t != YSTRING("MMStatus")) {
 	    Debug(this,DebugNote,"Unhandled '%s' in %s [%p]",t->c_str(),m.name(),this);
@@ -4409,10 +5136,22 @@ bool YBTSMM::handlePagingResponse(YBTSMessage& m, YBTSConn* conn, XmlElement& rs
     }
     Debug(this,DebugAll,"PagingResponse with %s=%s conn=%u [%p]",
 	type.c_str(),ident.c_str(),m.connId(),this);
+    int auth = 0;
+    if (conn)
+	auth = __plugin.havePagingMtService(ue,s_authMtCall,s_authMtSms,s_authMtUssd);
+    if (auth) {
+	YBTSConnAuthThread* th = new YBTSConnAuthThread(conn->connId(),ue,auth);
+	if (th->startup())
+	    return true;
+	delete th;
+	Debug(this,DebugNote,"Failed to start MT auth thread for conn=%u [%p]",
+	    m.connId(),this);
+	conn = 0;
+    }
     ue->stopPagingNow();
     if (conn && setConnUE(*conn,ue,rsp) != 0)
 	conn = 0;
-    // Always notify paging response even if something wetn wrong with the connection
+    // Always notify paging response even if something went wrong with the connection
     // This will allow entities waiting for paging response to stop waiting
     __plugin.checkMtService(ue,conn,true);
     return true;
@@ -4527,6 +5266,7 @@ void YBTSMM::handleLocationUpdate(YBTSMessage& m, const XmlElement& xml, YBTSCon
 	    return;
 	}
 	conn->lock();
+	conn->setFlag(YBTSConn::FLocUpd);
 	cause = setConnUE(*conn,ue,xml);
 	conn->unlock();
 	if (cause) {
@@ -4621,6 +5361,7 @@ void YBTSMM::handleCMServiceRequest(YBTSMessage& m, const XmlElement& xml, YBTSC
 	return;
     }
     RefPointer<YBTSUE> ue = conn->ue();
+    bool isSms = false;
     if (!ue) {
 	XmlElement* cmServType = 0;
 	XmlElement* identity = 0;
@@ -4633,7 +5374,8 @@ void YBTSMM::handleCMServiceRequest(YBTSMessage& m, const XmlElement& xml, YBTSC
 	    return;
 	}
 	const String& type = cmServType->getText();
-	if (type == s_cmMOCall || type == s_cmSMS || type == s_cmSS)
+	isSms = (type == s_cmSMS);
+	if (isSms || type == s_cmMOCall || type == s_cmSS)
 	    ;
 	else {
 	    Debug(this,DebugNote,
@@ -4679,6 +5421,8 @@ void YBTSMM::handleCMServiceRequest(YBTSMessage& m, const XmlElement& xml, YBTSC
     }
     ue->stopPagingNow();
     sendCMServiceRsp(m,conn,0);
+    if (isSms && __plugin.signalling())
+	__plugin.signalling()->setConnUsage(conn,true,YBTSConn::FCmSms,false);
     __plugin.checkMtService(ue,conn);
 }
 
@@ -5034,7 +5778,10 @@ YBTSChan::YBTSChan(YBTSConn* conn)
     m_tout(0),
     m_activeCall(0),
     m_pending(0),
-    m_route(0)
+    m_route(0),
+    m_routeInitial(true),
+    m_authThread(0),
+    m_authIndex(0)
 {
     if (!m_conn)
 	return;
@@ -5061,7 +5808,10 @@ YBTSChan::YBTSChan(YBTSUE* ue, YBTSConn* conn)
     m_tout(0),
     m_activeCall(0),
     m_pending(0),
-    m_route(0)
+    m_route(0),
+    m_routeInitial(true),
+    m_authThread(0),
+    m_authIndex(0)
 {
     if (m_conn)
 	__plugin.signalling()->setConnUsage(connId(),true);
@@ -5116,11 +5866,8 @@ bool YBTSChan::initOutgoing(Message& msg)
     if (!msg.getBoolValue(YSTRING("privacy")));
 	addXmlFromParam(*m_pending,msg,"CallingPartyBCDNumber",YSTRING("caller"));
     lck.drop();
-    if (!m_conn)
-	m_paging = ue()->startPaging(ChanTypeVoice);
     initChan();
-    startMT();
-    return true;
+    return initMT();
 }
 
 // Handle CC messages
@@ -5327,25 +6074,46 @@ bool YBTSChan::canAcceptMT()
     return true;
 }
 
+// Init MT
+bool YBTSChan::initMT()
+{
+    if (isIncoming() || m_hungup)
+	return false;
+    if (!m_conn && ue()) {
+	RefPointer<YBTSConn> c;
+	if (__plugin.signalling()->findConn(c,ue())) {
+	    if (c->flag(YBTSConn::FLocUpd))
+		return true;
+	    Lock lck(m_mutex);
+	    setConn(c);
+	}
+	else if (!m_paging)
+	    m_paging = ue()->startPaging(ChanTypeVoice);
+    }
+    if (s_authMtCall && m_conn && !m_conn->authenticated())
+	return startAuthThread();
+    startMT();
+    return true;
+}
+
 // Start a pending MT call
 void YBTSChan::startMT(YBTSConn* conn, bool pagingRsp)
 {
     if (pagingRsp)
 	stopPaging();
     Lock lck(m_mutex);
-    if (conn && !m_conn) {
-	m_conn = conn;
-	m_connId = conn->connId();
-	__plugin.signalling()->setConnUsage(m_connId,true);
-    }
-    else
-	conn = m_conn;
+    conn = setConn(conn);
     if (!conn) {
 	if (pagingRsp) {
 	    lck.drop();
 	    hangup("failure");
 	}
 	return;
+    }
+    if (s_authMtCall && !m_conn->authenticated()) {
+	Debug(this,DebugNote,"Can't start: connection not authenticated [%p]",this);
+	lck.drop();
+	hangup("failure");
     }
     if (m_cref >= 7 || !m_pending) {
 	if (m_cref >= 7)
@@ -5407,7 +6175,7 @@ YBTSCallDesc* YBTSChan::handleSetup(const XmlElement& xml, bool regular, const S
 	if (!m_activeCall)
 	    m_activeCall = call;
 	Debug(this,DebugInfo,"Added call '%s' [%p]",call->c_str(),this);
-	m_waitForTraffic = m_conn && m_conn->startTraffic();
+	m_waitForTraffic = m_conn && !m_conn->startTraffic();
 	return call;
     }
     bool rlc = !m_waitForTraffic;
@@ -5422,6 +6190,7 @@ YBTSCallDesc* YBTSChan::handleSetup(const XmlElement& xml, bool regular, const S
 void YBTSChan::hangup(const char* reason, bool final)
 {
     releaseRoute();
+    cancelAuthThread();
     ObjList calls;
     Lock lck(m_mutex);
     setReason(reason);
@@ -5464,13 +6233,60 @@ void YBTSChan::hangup(const char* reason, bool final)
 // Deref if we have a pending message and not final and not connected
 bool YBTSChan::releaseRoute(bool final)
 {
-    Message* m = takeRoute();
+    bool initial = false;
+    Message* m = takeRoute(&initial);
     if (!m)
 	return false;
-    if (!(final || getPeer()))
+    if (initial) {
+	Debug(this,DebugNote,"deref() on releasing initial route message [%p]",this);
 	deref();
+    }
     TelEngine::destruct(m);
     return true;
+}
+
+bool YBTSChan::startAuthThread()
+{
+    cancelAuthThread();
+    Message* m = 0;
+    if (isIncoming()) {
+	m = takeRoute();
+	if (!m)
+	    return false;
+    }
+    m_authThread = new YBTSChanThread(*this,m);
+    if (m_authThread->startup())
+	return true;
+    delete m_authThread;
+    m_authThread = 0;
+    Debug(this,DebugNote,"Failed to start auth thread [%p]",this);
+    return false;
+}
+
+void YBTSChan::cancelAuthThread()
+{
+    if (!m_authThread)
+	return;
+    Lock lck(driver());
+    if (!m_authThread)
+	return;
+    DDebug(this,DebugAll,"Cancelling auth thread [%p]",this);
+    m_authThread->cancel();
+    lck.drop();
+    while (m_authThread && !Thread::check(false))
+	Thread::idle();
+    m_authThread = 0;
+}
+
+// Set connection if not already set
+YBTSConn* YBTSChan::setConn(YBTSConn* conn)
+{
+    if (conn && !m_conn) {
+	m_conn = conn;
+	m_connId = conn->connId();
+	__plugin.signalling()->setConnUsage(m_connId,true);
+    }
+    return m_conn;
 }
 
 void YBTSChan::disconnected(bool final, const char *reason)
@@ -5478,6 +6294,19 @@ void YBTSChan::disconnected(bool final, const char *reason)
     Debug(this,DebugAll,"Disconnected '%s' [%p]",reason,this);
     setReason(reason,&m_mutex);
     Channel::disconnected(final,reason);
+    if (!(isIncoming() && s_noAuth == reason && m_route && m_conn))
+	return;
+    m_authIndex++;
+    if (m_authIndex > 2) {
+	m_conn->owner()->authReject(m_conn);
+	return;
+    }
+    Lock2 lck(driver(),&paramMutex());
+    m_route->clearParam(YSTRING("id"));
+    YBTSConnAuth::authClearParams(*m_route);
+    m_route->copySubParams(parameters(),"auth.",false);
+    lck.drop();
+    startAuthThread();
 }
 
 bool YBTSChan::callRouted(Message& msg)
@@ -5492,21 +6321,41 @@ bool YBTSChan::callRouted(Message& msg)
 
 void YBTSChan::callAccept(Message& msg)
 {
+    Lock lck(m_mutex);
+    m_reason.clear();
+    lck.drop();
     Channel::callAccept(msg);
     if (__plugin.media()) {
 	__plugin.media()->setSource(this);
 	__plugin.media()->setConsumer(this);
     }
+    // Remember message params to re-execute if we are disconnected before progressing
+    lck.acquire(driver());
+    m_route = new Message(msg);
 }
 
 void YBTSChan::callRejected(const char* error, const char* reason, const Message* msg)
 {
     Channel::callRejected(error,reason,msg);
     setReason(error,&m_mutex);
+    // Auth required from routing
+    if (!msg || s_noAuth != error || !m_conn)
+	return;
+    m_authIndex++;
+    if (m_authIndex > 2) {
+	m_conn->owner()->authReject(m_conn);
+	return;
+    }
+    Lock lck(driver());
+    m_route = new Message(*msg);
+    m_route->clearParam(YSTRING("id"));
+    lck.drop();
+    startAuthThread();
 }
 
 bool YBTSChan::msgProgress(Message& msg)
 {
+    progressedIn();
     Channel::msgProgress(msg);
     Lock lck(m_mutex);
     if (m_hungup)
@@ -5521,6 +6370,7 @@ bool YBTSChan::msgProgress(Message& msg)
 
 bool YBTSChan::msgRinging(Message& msg)
 {
+    progressedIn();
     Channel::msgRinging(msg);
     Lock lck(m_mutex);
     if (m_hungup)
@@ -5535,6 +6385,7 @@ bool YBTSChan::msgRinging(Message& msg)
 
 bool YBTSChan::msgAnswered(Message& msg)
 {
+    progressedIn();
     Channel::msgAnswered(msg);
     Lock lck(m_mutex);
     if (m_hungup)
@@ -5592,6 +6443,8 @@ bool YBTSChan::msgDrop(Message& msg, const char* reason)
 
 void YBTSChan::destroyed()
 {
+    XDebug(this,DebugAll,"Destroying [%p]",this);
+    cancelAuthThread();
     hangup(0,true);
     stopPaging();
     TelEngine::destruct(m_pending);
@@ -5600,6 +6453,90 @@ void YBTSChan::destroyed()
 	__plugin.signalling()->setConnUsage(m_conn->connId(),false);
     Debug(this,DebugCall,"Destroyed [%p]",this);
     Channel::destroyed();
+}
+
+
+//
+// YBTSChanThread
+//
+YBTSChanThread::YBTSChanThread(YBTSChan& chan, Message* msg)
+    : Thread("YBTSChan"),
+    YBTSConnAuthMt(chan.connId(),0,
+	chan.isIncoming() ? YBTSConn::FMoCall : YBTSConn::FMtCall),
+    m_chan(&chan),
+    m_route(msg)
+{
+}
+
+void YBTSChanThread::run()
+{
+    if (!m_chan)
+	return;
+    XDebug(m_chan,DebugAll,"Started authentication thread [%p]",(YBTSChan*)m_chan);
+    if (m_chan->isOutgoing()) {
+	notify(authMt());
+	return;
+    }
+    if (!m_route) {
+	Debug(m_chan,DebugNote,"No message to start authentication [%p]",(YBTSChan*)m_chan);
+	return;
+    }
+    String reason;
+    bool ok = authSend(*m_route,reason);
+    if (!ok || reason || !(m_authOk || m_authNeedResync) || threadExiting(reason)) {
+	if (reason)
+	    Debug(m_chan,DebugNote,"Failed to complete authentication: %s [%p]",
+		reason.c_str(),(YBTSChan*)m_chan);
+	if (m_conn && m_conn->authSent(YBTSConn::FMoCall)) {
+	    Debug(m_chan,DebugNote,"Rejecting authentication [%p]",(YBTSChan*)m_chan);
+	    authReject();
+	}
+	return;
+    }
+    authSetParams(*m_route);
+    if (*m_route != YSTRING("call.execute")) {
+	m_route->userData(0);
+	if (__plugin.haveChan(m_chan->id()) && m_chan->ref()) {
+	    m_chan->startRouter(m_route);
+	    m_route = 0;
+	}
+	return;
+    }
+    // Execute
+    m_route->userData(m_chan);
+    ok = Engine::dispatch(*m_route);
+    if (!__plugin.haveChan(m_chan->id()))
+	return;
+    if (ok)
+	m_chan->callAccept(*m_route);
+    else {
+	const char* error = m_route->getValue(YSTRING("error"),"noconn");
+	m_chan->callRejected(error,m_route->getValue(YSTRING("reason")),m_route);
+    }
+}
+
+void YBTSChanThread::notify(const char* error)
+{
+    TelEngine::destruct(m_route);
+    RefPointer<YBTSChan> chan = m_chan;
+    m_chan = 0;
+    if (!chan)
+	return;
+    XDebug(chan,DebugAll,"Authentication thread terminated ref=%u [%p]",
+	chan->refcount(),(YBTSChan*)chan);
+    if (chan->isOutgoing() && !Thread::check(false)) {
+	if (!error) {
+	    Lock lck(chan->m_mutex);
+	    if (!chan->m_hungup)
+		chan->startMT();
+	}
+	else
+	    chan->hangup(error);
+    }
+    Lock lck(chan->driver());
+    if (chan->m_authThread == this)
+	chan->m_authThread = 0;
+    chan = 0;
 }
 
 
@@ -5849,19 +6786,51 @@ void YBTSDriver::handleSSPDU(YBTSMessage& m, YBTSConn* conn)
 }
 
 // Check and start pending MT services for new connection
-void YBTSDriver::checkMtService(YBTSUE* ue, YBTSConn* conn, bool pagingRsp)
+void YBTSDriver::checkMtService(YBTSUE* ue, YBTSConn* conn, bool pagingRsp,
+    bool sapiEstablish)
 {
     if (!ue || !conn)
 	return;
-    RefPointer<YBTSChan> chan;
-    if (findChan(ue,chan)) {
-	chan->startMT(conn,pagingRsp);
-	chan = 0;
+    if (!sapiEstablish) {
+	RefPointer<YBTSChan> chan;
+	if (findChan(ue,chan)) {
+	    chan->startMT(conn,pagingRsp);
+	    chan = 0;
+	}
     }
     // Check pending SMS
     checkMtSms(ue);
     // Check pending MT SS
     checkMtSs(conn);
+}
+
+// Check if there is any paging MT service for a given UE
+int YBTSDriver::havePagingMtService(YBTSUE* ue, bool call, bool sms, bool ussd)
+{
+    if (!ue)
+	return 0;
+    if (call) {
+	RefPointer<YBTSChan> chan;
+	if (findChan(ue,chan) && chan->m_paging)
+	    return YBTSConn::FMtCall;
+    }
+    if (sms) {
+	RefPointer<YBTSMtSmsList> list;
+	if (findMtSmsList(list,ue) && list->paging())
+	    return YBTSConn::FMtSms;
+    }
+    if (ussd && m_mtSsNotEmpty) {
+	Lock lck(m_mtSsMutex);
+	for (ObjList* o = m_mtSs.skipNull(); o;) {
+	    YBTSTid* ss = static_cast<YBTSTid*>(o->get());
+	    if (ss->m_ue != ue)
+		continue;
+	    if (ss->m_paging)
+		return YBTSConn::FMtUssd;
+	    break;
+	}
+    }
+    return 0;
 }
 
 // Handle media start/alloc response
@@ -5957,20 +6926,28 @@ bool YBTSDriver::handshakeDone()
     return true;
 }
 
-void YBTSDriver::connReleased(uint16_t connId)
+void YBTSDriver::connReleased(uint16_t connId, YBTSConn* conn)
 {
+    bool locUpdTerminated = conn && conn->ue() && conn->flag(YBTSConn::FLocUpd);
     RefPointer<YBTSChan> chan;
-    findChan(connId,chan);
-    if (chan) {
+    if (findChan(connId,chan)) {
 	chan->connReleased();
 	chan = 0;
     }
+    else if (locUpdTerminated && findChan(conn->ue(),chan)) {
+	if (chan->isOutgoing() && chan->m_pending && !chan->m_conn)
+	    chan->initMT();
+	chan = 0;
+    }
     removeTerminatedCall(connId);
-    // Reset connection for pending MT SMS
+    // Reset connection for pending MT SMS or set check flag
     RefPointer<YBTSMtSmsList> list;
-    if (findMtSmsList(list,connId)) {
+    if (!findMtSmsList(list,connId) && locUpdTerminated)
+	findMtSmsList(list,conn->ue());
+    if (list) {
 	list->lock();
 	list->m_conn = 0;
+	list->m_auth = 0;
 	for (ObjList* o = list->m_sms.skipNull(); o; o = o->skipNext()) {
 	    YBTSMtSms* sms = static_cast<YBTSMtSms*>(o->get());
 	    // Reset sent flag to allow it to be re-sent
@@ -5982,6 +6959,32 @@ void YBTSDriver::connReleased(uint16_t connId)
 	list->m_check = true;
 	list->unlock();
 	list = 0;
+    }
+    // Check pending SS services
+    if (locUpdTerminated && m_mtSsNotEmpty) {
+	ObjList list;
+	m_mtSsMutex.lock();
+	for (ObjList* o = m_mtSs.skipNull(); o ;) {
+	    YBTSTid* ss = static_cast<YBTSTid*>(o->get());
+	    if (ss->m_paging || conn->ue() != ss->m_ue) {
+		o = o->skipNext();
+		continue;
+	    }
+	    ss->m_paging = ss->m_ue->startPaging(ChanTypeSS);
+	    if (ss->m_paging) {
+		o = o->skipNext();
+		continue;
+	    }
+	    list.append(o->remove(false));
+	    o = o->skipNull();
+	}
+	m_mtSsNotEmpty = (m_mtSs.skipNull() != 0);
+	m_mtSsMutex.unlock();
+	for (ObjList* o = list.skipNull(); o; o = o->skipNext()) {
+	    YBTSTid* ss = static_cast<YBTSTid*>(o->get());
+	    Debug(this,DebugNote,"Idle MT USSD '%s' failed to start paging",ss->c_str());
+	    enqueueSS(ss->ssMessage(false),0,false,"failure");
+	}
     }
 }
 
@@ -6085,12 +7088,33 @@ bool YBTSDriver::handleUssdExecute(Message& msg, String& dest)
 	msg.setParam(s_error,"failure");
 	return false;
     }
-    String ssId;
-    ssId << ssIdPrefix() << ssIndex();
-    YBTSTid* ss = new YBTSTid(YBTSTid::Ussd,"0",false,0,ssId);
     unsigned int tout = msg.getIntValue(YSTRING("timeout"),s_ussdTimeout,
 	YBTS_USSD_TIMEOUT_MIN);
     unsigned int maxPdd = getMaxPddPaging(msg,YBTS_USSD_TIMEOUT_MIN,tout);
+    RefPointer<YBTSConn> conn;
+    m_signalling->findConn(conn,ue);
+    bool startPaging = true;
+    if (conn && conn->flag(YBTSConn::FLocUpd)) {
+	conn = 0;
+	startPaging = false;
+    }
+    Debug(this,DebugAll,"Processing MT USSD to '%s' conn=%u",
+	dest.c_str(),(conn ? conn->connId() : 0));
+    // Authenticate connection
+    if (s_authMtUssd && conn && !conn->authenticated()) {
+	const char* error = authConnMt(conn,false,maxPdd);
+	if (error) {
+	    msg.setParam(s_error,error);
+	    return false;
+	}
+	if (!maxPdd) {
+	    msg.setParam(s_error,"postdialdelay");
+	    return false;
+	}
+    }
+    String ssId;
+    ssId << ssIdPrefix() << ssIndex();
+    YBTSTid* ss = new YBTSTid(YBTSTid::Ussd,"0",false,0,ssId);
     ss->m_pddTout = ss->m_timeout = Time::now();
     ss->m_timeout += (uint64_t)tout * 1000;
     ss->m_pddTout += (uint64_t)maxPdd * 1000;
@@ -6099,9 +7123,8 @@ bool YBTSDriver::handleUssdExecute(Message& msg, String& dest)
     ss->m_startCID = "0";
     ss->m_ue = ue;
     ss->m_cid = 0;
-    RefPointer<YBTSConn> conn;
-    if (!m_signalling->findConn(conn,ue) || conn->waitForTraffic()) {
-	if (!conn) {
+    if (!conn || conn->waitForTraffic()) {
+	if (!conn && startPaging) {
 	    ss->m_paging = ue->startPaging(ChanTypeSS);
 	    if (!ss->m_paging) {
 		TelEngine::destruct(ss);
@@ -6197,6 +7220,11 @@ const char* YBTSDriver::startMtSs(YBTSConn* conn, YBTSTid*& ss)
 	Debug(this,DebugNote,"MT USSD '%s' IMSI='%s' failed: SS busy",
 	    ss->c_str(),imsi.c_str());
 	return "busy";
+    }
+    if (s_authMtUssd && !conn->authenticated()) {
+	Debug(this,DebugNote,"MT USSD '%s' IMSI='%s' failed: connection not authenticated",
+	    ss->c_str(),imsi.c_str());
+	return "failure";
     }
     conn->m_ss = ss;
     uint64_t tout = ss->m_timeout;
@@ -6481,7 +7509,7 @@ void YBTSDriver::handleSmsCPRsp(YBTSMessage& m, YBTSConn* conn,
 	handleMtSmsRsp(conn->ue(),false,callRef);
 }
 
-bool YBTSDriver::checkMtSms(YBTSMtSmsList& list)
+bool YBTSDriver::checkMtSms(YBTSMtSmsList& list, unsigned int* toutAuth)
 {
     Lock lck(list);
     ObjList* o = list.m_sms.skipNull();
@@ -6517,21 +7545,54 @@ bool YBTSDriver::checkMtSms(YBTSMtSmsList& list)
 	    return true;
 	}
 	list.stopPaging();
-	signalling()->setConnUsage(list.m_conn->connId(),true,true);
+	if (list.m_conn->flag(YBTSConn::FLocUpd)) {
+	    list.m_conn = 0;
+	    return true;
+	}
+	if (list.m_auth == 1)
+	    return true;
+	if (!list.m_auth && s_authMtSms && !list.m_conn->authenticated()) {
+	    const char* error = "failure";
+	    if (toutAuth) {
+		list.m_auth = 1;
+		lck.drop();
+		error = authConnMt(list.m_conn,true,*toutAuth);
+		lck.acquire(list);
+		list.m_auth = 2;
+		if (!error) {
+		    lck.drop();
+		    return checkMtSms(list);
+		}
+	    }
+	    list.m_conn = 0;
+	    String imsi;
+	    list.ue()->imsiSafe(imsi);
+	    for (ObjList* o = list.m_sms.skipNull(); o; o = o->skipNext()) {
+		YBTSMtSms* sms = static_cast<YBTSMtSms*>(o->get());
+		Debug(this,DebugNote,"Dropping MT SMS '%s' to IMSI=%s: %s",
+		    sms->id().c_str(),imsi.c_str(),
+		    (toutAuth ? error : "connection not authenticated"));
+		sms->terminate(false,error);
+	    }
+	    return true;
+	}
+	signalling()->setConnUsage(list.m_conn,true,YBTSConn::FMtSms);
     }
-    // Wait for traffic to start (channel mode change was requested)
     if (list.m_conn->waitForTraffic())
 	return true;
     // Check for SAPI 3 availability
     uint8_t sapi = list.m_conn->startSapi(3);
     if (sapi == 255)
 	return true;
+    list.m_auth = 0;
     sms->m_callRef = list.m_tid++;
     if (list.m_tid >= 7)
 	list.m_tid = 0;
     if (signalling()->sendSmsCPData(list.m_conn,sms->callRef(),false,sapi,sms->rpdu())) {
+	String imsi;
+	list.ue()->imsiSafe(imsi);
 	Debug(this,DebugAll,"MT SMS '%s' to IMSI=%s sent on conn %u",
-	    sms->id().c_str(),list.ue()->imsi().c_str(),list.m_conn->connId());
+	    sms->id().c_str(),imsi.c_str(),list.m_conn->connId());
 	sms->m_sent = true;
 	return true;
     }
@@ -6544,9 +7605,7 @@ bool YBTSDriver::checkMtSms(YBTSMtSmsList& list)
 
 void YBTSDriver::checkMtSs(YBTSConn* conn)
 {
-    if (!(conn && conn->ue()))
-	return;
-    if (conn->waitForTraffic())
+    if (!(conn && conn->ue()) || conn->flag(YBTSConn::FLocUpd))
 	return;
     ObjList list;
     m_mtSsMutex.lock();
@@ -6843,6 +7902,26 @@ void YBTSDriver::checkMtSsTout(const Time& time)
     }
 }
 
+const char* YBTSDriver::authConnMt(YBTSConn* conn, bool sms, unsigned int& toutMs)
+{
+    if (!conn)
+	return 0;
+    if (conn->authenticated())
+	return 0;
+    if (sms) {
+	if (!s_authMtSms)
+	    return 0;
+    }
+    else if (!s_authMtUssd)
+	return 0;
+    YBTSConnAuthMt auth(conn->connId(),conn->ue(),
+	sms ? YBTSConn::FMtSms : YBTSConn::FMtUssd);
+    unsigned int n = threadIdleIntervals(toutMs);
+    const char* fail = auth.authMt(&n);
+    toutMs = n * Thread::idleMsec();
+    return fail;
+}
+
 void YBTSDriver::start()
 {
     stop();
@@ -6989,6 +8068,7 @@ bool YBTSDriver::startPeer()
 	    continue;
 	::close(i);
     }
+    ::dup2(STDERR_FILENO,STDOUT_FILENO);
     // Close all other handles
     for (; i < 1024; i++)
 	::close(i);
@@ -7221,10 +8301,10 @@ bool YBTSDriver::handleMsgExecute(Message& msg, const String& dest)
     }
     Debug(this,DebugInfo,"MT SMS '%s' to IMSI=%s",
 	sms->id().c_str(),ue->imsi().c_str());
-    checkMtSms(*list);
     unsigned int intervals = msg.getIntValue(YSTRING("timeout"),s_mtSmsTimeout,
 	YBTS_MT_SMS_TIMEOUT_MIN,YBTS_MT_SMS_TIMEOUT_MAX);
     unsigned int maxPdd = getMaxPddPaging(msg,YBTS_MT_SMS_TIMEOUT_MIN,intervals);
+    checkMtSms(*list,&maxPdd);
     intervals = threadIdleIntervals(intervals);
     maxPdd = threadIdleIntervals(maxPdd);
     while (sms->active()) {
@@ -7535,6 +8615,7 @@ void YBTSDriver::initialize()
     Output("Initializing module YBTS");
     Configuration cfg(Engine::configFile("ybts"));
     const NamedList& gsm = safeSect(cfg,YSTRING("gsm"));
+    const NamedList& security = safeSect(cfg,YSTRING("security"));
     YBTSLAI lai;
     String mcc = gsm.getValue(YSTRING("Identity.MCC"),YBTS_MCC_DEFAULT);
     String mnc = gsm.getValue(YSTRING("Identity.MNC"),YBTS_MNC_DEFAULT);
@@ -7553,18 +8634,18 @@ void YBTSDriver::initialize()
     const NamedList& gsmAdvanced = safeSect(cfg,YSTRING("gsm_advanced"));
     s_pagingTout = getPagingTout(gsmAdvanced,YSTRING("Timer.T3113"));
     const NamedList& ybts = safeSect(cfg,YSTRING("ybts"));
-    s_restartMax = ybts.getIntValue("max_restart",
+    s_restartMax = ybts.getIntValue(YSTRING("max_restart"),
 	YBTS_RESTART_COUNT_DEF,YBTS_RESTART_COUNT_MIN);
-    s_restartMs = ybts.getIntValue("restart_interval",
+    s_restartMs = ybts.getIntValue(YSTRING("restart_interval"),
 	YBTS_RESTART_DEF,YBTS_RESTART_MIN,YBTS_RESTART_MAX);
-    s_t305 = ybts.getIntValue("t305",30000,20000,60000);
-    s_t308 = ybts.getIntValue("t308",5000,4000,20000);
-    s_t313 = ybts.getIntValue("t313",5000,4000,20000);
-    s_tmsiExpire = ybts.getIntValue("tmsi_expire",864000,7200,2592000);
-    s_tmsiSave = ybts.getBoolValue("tmsi_save");
-    s_mtSmsTimeout = ybts.getIntValue("sms.timeout",
+    s_t305 = ybts.getIntValue(YSTRING("t305"),30000,20000,60000);
+    s_t308 = ybts.getIntValue(YSTRING("t308"),5000,4000,20000);
+    s_t313 = ybts.getIntValue(YSTRING("t313"),5000,4000,20000);
+    s_tmsiExpire = ybts.getIntValue(YSTRING("tmsi_expire"),864000,7200,2592000);
+    s_tmsiSave = ybts.getBoolValue(YSTRING("tmsi_save"));
+    s_mtSmsTimeout = ybts.getIntValue(YSTRING("sms.timeout"),
 	YBTS_MT_SMS_TIMEOUT_DEF,YBTS_MT_SMS_TIMEOUT_MIN,YBTS_MT_SMS_TIMEOUT_MAX);
-    s_ussdTimeout = ybts.getIntValue("ussd.session_timeout",
+    s_ussdTimeout = ybts.getIntValue(YSTRING("ussd.session_timeout"),
 	YBTS_USSD_TIMEOUT_DEF,YBTS_USSD_TIMEOUT_MIN);
     const String& expXml = ybts[YSTRING("export_xml_as")];
     if (expXml == YSTRING("string"))
@@ -7573,6 +8654,10 @@ void YBTSDriver::initialize()
 	m_exportXml = 0;
     else
 	m_exportXml = 1;
+    s_t3260 = security.getIntValue(YSTRING("t3260"),720000,5000,3600000);
+    s_authMtCall = security.getBoolValue(YSTRING("auth.call"));
+    s_authMtSms = security.getBoolValue(YSTRING("auth.sms"));
+    s_authMtUssd = security.getBoolValue(YSTRING("auth.ussd"));
     s_globalMutex.lock();
     if (lai.lai()) {
 	if (lai != s_lai || !s_lai.lai()) {
@@ -7611,6 +8696,10 @@ void YBTSDriver::initialize()
     s << "\r\npeer_arg=" << s_peerArg;
     s << "\r\npeer_dir=" << s_peerDir;
     s << "\r\nexport_xml_as=" << (m_exportXml > 0 ? "object" : (m_exportXml ? "string" : "both"));
+    s << "\r\nt3260=" << s_t3260;
+    s << "\r\nauth.call=" << String::boolText(s_authMtCall);
+    s << "\r\nauth.sms=" << String::boolText(s_authMtSms);
+    s << "\r\nauth.ussd=" << String::boolText(s_authMtUssd);
     Debug(this,DebugAll,"Initialized\r\n-----%s\r\n-----",s.c_str());
 #endif
     s_globalMutex.unlock();
@@ -7665,7 +8754,8 @@ bool YBTSDriver::msgExecute(Message& msg, String& dest)
 	return false;
     }
     RefPointer<YBTSConn> conn;
-    m_signalling->findConn(conn,ue);
+    if (m_signalling->findConn(conn,ue) && conn->flag(YBTSConn::FLocUpd))
+	conn = 0;
     chan = new YBTSChan(ue,conn);
     bool ok = chan->initOutgoing(msg);
     lckCallStart.drop();
