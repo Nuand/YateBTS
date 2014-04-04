@@ -120,6 +120,18 @@ int bladeRFDevice::open(const std::string &, bool)
       return -1;
   }
 
+  unsigned int act;
+  if (bladerf_set_bandwidth(bdev, BLADERF_MODULE_TX, 1500000, &act)) {
+      LOG(EMERG) << "Error setting TX LPF";
+      return -1;
+  }
+  LOG(EMERG) << "actual " << act;
+
+  if (bladerf_set_bandwidth(bdev, BLADERF_MODULE_RX, 1500000, &act)) {
+      LOG(EMERG) << "Error setting TX LPF";
+      return -1;
+  }
+
   /* Stream defaults */
 #define DEFAULT_STREAM_XFERS        64
 #define DEFAULT_STREAM_BUFFERS      5600
