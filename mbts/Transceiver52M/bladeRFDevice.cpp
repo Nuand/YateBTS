@@ -397,7 +397,7 @@ int bladeRFDevice::writeSamples(short *buf, int len, bool *underrun,
 {
     int olen;
     olen = len;
-    int i;
+  //  int i;
 
     if (!bdev) return 0;
 
