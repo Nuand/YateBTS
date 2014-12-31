@@ -46,6 +46,8 @@
 #include "config.h"
 #endif
 
+#define NULL 0
+
 using namespace std;
 
 bladeRFDevice::bladeRFDevice(int sps, bool skipRx)
